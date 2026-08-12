@@ -1505,13 +1505,15 @@ $('#btnSaveCov').addEventListener('click', async () => {
 let syncing = false;
 
 async function uploadOne(r){
-  const files = [];
+  // 이미 올라간 파일은 다시 보내지 않는다. 수정 후 재전송 때 드라이브에 중복이 쌓이는 걸 막는다.
+  const files = [], keep = { audio:[], card:[], photo:[] };
   for (const f of (r.files || [])){
+    if (f.url){ (keep[f.kind] = keep[f.kind] || []).push(f.url); continue; }
     files.push({ kind:f.kind, name:f.name, mime:f.mime, b64: await blobToB64(f.blob) });
   }
   const payload = {
     token: S.token, type: r.type, id: r.id, monitor: r.monitor,
-    createdAt: r.createdAt, fields: r.fields, files: files
+    createdAt: r.createdAt, fields: r.fields, files: files, links: keep
   };
   // Content-Type을 text/plain으로 두어야 Apps Script에서 preflight 없이 받는다.
   const res = await fetch(S.endpoint, {
@@ -1522,6 +1524,15 @@ async function uploadOne(r){
   const txt = await res.text();
   let out; try { out = JSON.parse(txt); } catch(e){ throw new Error('서버 응답을 읽지 못했습니다'); }
   if (!out.ok) throw new Error(out.error || '서버가 거부했습니다');
+
+  // 돌려받은 드라이브 주소를 파일에 새겨둔다 → 다음 수정 때 이 파일은 건너뛴다
+  const back = out.links || {}, seen = {};
+  for (const f of (r.files || [])){
+    seen[f.kind] = seen[f.kind] || 0;
+    const arr = back[f.kind] || [];
+    if (arr[seen[f.kind]]) f.url = arr[seen[f.kind]];
+    seen[f.kind]++;
+  }
   return out;
 }
 
@@ -1654,17 +1665,227 @@ async function refreshBox(){
       imgs.forEach(fl => { const i = new Image(); i.src = URL.createObjectURL(fl.blob); w.appendChild(i); });
       d.appendChild(w);
     }
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;margin-top:10px';
+
+    const ed = document.createElement('button');
+    ed.className = 'btn ghost';
+    ed.style.cssText = 'margin:0;padding:10px;font-size:13.5px';
+    ed.textContent = '수정';
+    ed.onclick = () => openEdit(r);
+
     const rm = document.createElement('button');
-    rm.className = 'btn danger'; rm.style.marginTop = '9px'; rm.style.padding = '9px';
-    rm.style.fontSize = '13px'; rm.textContent = '삭제';
+    rm.className = 'btn danger';
+    rm.style.cssText = 'margin:0;padding:10px;font-size:13.5px;flex:0 0 90px';
+    rm.textContent = '삭제';
     rm.onclick = async () => {
       if (r.status !== 'synced' && !confirm('아직 업로드되지 않았습니다. 정말 삭제할까요?')) return;
       if (r.status === 'synced' && !confirm('삭제할까요? 서버 자료는 남습니다.')) return;
       await del(r.id); refreshBox();
     };
-    d.appendChild(rm);
+    row.appendChild(ed); row.appendChild(rm);
+    d.appendChild(row);
     el.appendChild(d);
   });
+}
+
+/* =========================================================================
+   11-1. 기록 수정
+   저장된 뒤에도 고칠 수 있어야 한다. 고쳐서 다시 올리면 같은 기록ID 라서
+   시트의 그 줄이 덮어써진다. 이미 올라간 음성·사진은 다시 올리지 않는다.
+   ========================================================================= */
+const ESC = s => String(s == null ? '' : s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+/* 저장돼 있던 값을 3단 선택기에 되돌려 놓는다 */
+function applyPicker(ids, f){
+  const dS = $('#'+ids.date), vS = $('#'+ids.venue), pS = ids.prog ? $('#'+ids.prog) : null;
+  if (f.progDate && DATES.some(d => d.d === f.progDate)){
+    dS.value = f.progDate; dS.dispatchEvent(new Event('change'));
+  }
+  if (f.venue){
+    if (Array.from(vS.options).some(o => o.value === f.venue)) vS.value = f.venue;
+    else { vS.value = '기타'; const e = $('#'+ids.venueEtc); if (e) e.value = f.venue; }
+    vS.dispatchEvent(new Event('change'));
+  }
+  if (pS && f.show){
+    const want = (f.progTime || '') + '|' + f.show;
+    if (Array.from(pS.options).some(o => o.value === want)) pS.value = want;
+    else { pS.value = '기타'; const e = $('#'+ids.progEtc); if (e) e.value = f.show; }
+    pS.dispatchEvent(new Event('change'));
+  }
+}
+
+function issueMarkup(prefix, f){
+  return ISSUES.map(it =>
+    '<div style="margin-bottom:11px"><div style="font-size:13px;font-weight:700;margin-bottom:5px">' +
+    it.label + '</div><div class="seg mini" data-i="' + it.id + '">' +
+    ['찬성','반대','중립'].map(v =>
+      '<button type="button" data-v="' + v + '" aria-pressed="' +
+      (f[it.id] === v ? 'true' : 'false') + '">' + v + '</button>').join('') +
+    '</div></div>').join('');
+}
+
+function openEdit(rec0){
+  const f = Object.assign({}, rec0.fields || {});
+  const t = rec0.type;
+  const wrap = document.createElement('div');
+  wrap.className = 'sheet';
+
+  let body = '';
+  if (t === 'interview'){
+    body =
+      '<div class="card"><h2>공연 · 진행</h2>' +
+        '<label class="f"><span>일자</span><select id="eDate"></select></label>' +
+        '<label class="f"><span>장소</span><select id="eVenue"></select></label>' +
+        '<label class="f hide" id="eVenueEtcWrap"><span>장소 직접 입력</span>' +
+          '<input type="text" id="eVenueEtc"></label>' +
+        '<label class="f"><span>프로그램</span><select id="eProg"></select></label>' +
+        '<label class="f hide" id="eShowWrap"><span>프로그램 직접 입력</span>' +
+          '<input type="text" id="eShow"></label>' +
+        '<label class="f" style="margin-bottom:0"><span>진행요원</span>' +
+          '<input type="text" id="eBy" value="' + ESC(f.by) + '"></label></div>' +
+
+      '<div class="card"><h2>인터뷰이</h2><div class="row">' +
+        '<label class="f"><span>인터뷰 번호</span><input type="text" id="eCode" value="' + ESC(f.code) + '"></label>' +
+        '<label class="f"><span>대상 유형</span><select id="eType">' +
+          ['초청 전문가','출연진','취재 기자','기타'].map(v =>
+            '<option' + (f.targetType === v ? ' selected' : '') + '>' + v + '</option>').join('') +
+        '</select></label></div><div class="row">' +
+        '<label class="f"><span>성명</span><input type="text" id="eName" value="' + ESC(f.name) + '"></label>' +
+        '<label class="f"><span>소속</span><input type="text" id="eAffil" value="' + ESC(f.affil) + '"></label>' +
+      '</div></div>' +
+
+      '<div class="card"><h2>다룬 항목 · 응답 요지</h2>' +
+        '<p class="sub">항목 버튼을 눌러 켜고 끌 수 있습니다</p>' +
+        GUIDE.map(g =>
+          '<div style="margin-bottom:14px">' +
+          '<button type="button" class="chip eitem" data-k="' + g.key + '" aria-pressed="' +
+            ((f.items || '').indexOf(g.sym) >= 0 ? 'true' : 'false') + '" ' +
+            'style="width:100%;text-align:left">' + g.label + '</button>' +
+          '<textarea class="qmemo emo" data-k="' + g.key + '" style="margin-top:8px" ' +
+            'placeholder="이 항목 응답 요지">' + ESC(f['m' + g.key]) + '</textarea></div>').join('') +
+      '</div>' +
+
+      '<div class="card"><h2>쟁점</h2>' + issueMarkup('e', f) + '</div>' +
+
+      '<div class="card"><h2>현장 메모</h2>' +
+        '<textarea id="eMemo">' + ESC(f.memo) + '</textarea>' +
+        '<label class="f" style="margin:12px 0 0;display:flex;align-items:center;gap:9px">' +
+        '<input type="checkbox" id="eNoRec"' + (f.noRecord === 'Y' ? ' checked' : '') +
+          ' style="width:20px;height:20px;flex:0 0 auto">' +
+        '<span style="margin:0;font-weight:600">녹음 거절</span></label></div>';
+
+  } else if (t === 'observation'){
+    body =
+      '<div class="card"><h2>관찰</h2>' +
+        '<label class="f"><span>구분</span><select id="eKind">' +
+          ['③ 관람객 태도','④ 부대행사 · 시설','스탭 · 자원봉사 애로','여론 · 언론 동향'].map(v =>
+            '<option' + (f.kind === v ? ' selected' : '') + '>' + v + '</option>').join('') +
+        '</select></label>' +
+        '<label class="f"><span>일자</span><select id="eDate"></select></label>' +
+        '<label class="f"><span>장소</span><select id="eVenue"></select></label>' +
+        '<label class="f hide" id="eVenueEtcWrap"><span>장소 직접 입력</span>' +
+          '<input type="text" id="eVenueEtc"></label>' +
+        '<label class="f" style="margin-bottom:0"><span>내용</span>' +
+          '<textarea id="eText" style="min-height:150px">' + ESC(f.text) + '</textarea></label></div>';
+
+  } else {
+    body =
+      '<div class="card"><h2>관람</h2>' +
+        '<label class="f"><span>일자</span><select id="eDate"></select></label>' +
+        '<label class="f"><span>장소</span><select id="eVenue"></select></label>' +
+        '<label class="f hide" id="eVenueEtcWrap"><span>장소 직접 입력</span>' +
+          '<input type="text" id="eVenueEtc"></label>' +
+        '<label class="f"><span>프로그램</span><select id="eProg"></select></label>' +
+        '<label class="f hide" id="eShowWrap"><span>프로그램 직접 입력</span>' +
+          '<input type="text" id="eShow"></label>' +
+        '<label class="f"><span>관람 정도</span><div class="seg" id="eDegree">' +
+          ['전체','부분','스침'].map(v =>
+            '<button type="button" data-v="' + v + '" aria-pressed="' +
+            (f.degree === v ? 'true' : 'false') + '">' + v + '</button>').join('') +
+        '</div></label>' +
+        '<label class="f" style="margin:12px 0 0"><span>비고</span>' +
+          '<textarea id="eNote" style="min-height:90px">' + ESC(f.note) + '</textarea></label></div>';
+  }
+
+  const when = rec0.createdAt.replace('T',' ').slice(0,16);
+  wrap.innerHTML =
+    '<div class="inner"><h2>기록 수정</h2>' +
+    '<p class="tiny" style="margin:-6px 0 12px">' + TYPE_LABEL[t] + ' · ' + when +
+    ' · 저장하면 서버의 같은 줄을 덮어씁니다. 이미 올라간 녹음과 사진은 그대로 유지됩니다.</p>' +
+    body +
+    '<button class="btn" id="eSave">수정 저장</button>' +
+    '<button class="btn grey" id="eCancel">취소</button></div>';
+
+  document.body.appendChild(wrap);
+  wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+  $('#eCancel', wrap).onclick = () => wrap.remove();
+
+  // 3단 선택기 붙이고 저장된 값 되돌리기
+  const ids = { date:'eDate', venue:'eVenue', venueEtcWrap:'eVenueEtcWrap', venueEtc:'eVenueEtc' };
+  if (t !== 'observation'){ ids.prog = 'eProg'; ids.progEtcWrap = 'eShowWrap'; ids.progEtc = 'eShow'; }
+  else ids.allVenues = true;
+  const pk = makePicker(ids);
+  applyPicker(ids, f);
+
+  // 항목 칩 / 쟁점 / 관람정도 토글
+  $$('.eitem', wrap).forEach(b => b.addEventListener('click', () =>
+    b.setAttribute('aria-pressed', b.getAttribute('aria-pressed') === 'true' ? 'false' : 'true')));
+  $$('.seg[data-i]', wrap).forEach(seg => seg.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    const on = b.getAttribute('aria-pressed') === 'true';
+    $$('button', seg).forEach(x => x.setAttribute('aria-pressed','false'));
+    if (!on) b.setAttribute('aria-pressed','true');
+  }));
+  const dg = $('#eDegree', wrap);
+  if (dg) dg.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    $$('button', dg).forEach(x => x.setAttribute('aria-pressed','false'));
+    b.setAttribute('aria-pressed','true');
+  });
+
+  $('#eSave', wrap).onclick = async () => {
+    const p = pk.read();
+    const nf = Object.assign({}, f);           // 녹음시각·표시·위치 등은 그대로 둔다
+    nf.progDate = p.date; nf.venue = p.venue;
+    if (t !== 'observation'){ nf.progTime = p.time; nf.show = p.show; }
+
+    if (t === 'interview'){
+      nf.code  = $('#eCode', wrap).value.trim() || f.code;
+      nf.by    = $('#eBy', wrap).value.trim();
+      nf.targetType = $('#eType', wrap).value;
+      nf.name  = $('#eName', wrap).value.trim();
+      nf.affil = $('#eAffil', wrap).value.trim();
+      nf.items = GUIDE.filter(g =>
+        $('.eitem[data-k="' + g.key + '"]', wrap).getAttribute('aria-pressed') === 'true')
+        .map(g => g.sym).join(' ');
+      GUIDE.forEach(g => { nf['m' + g.key] = $('.emo[data-k="' + g.key + '"]', wrap).value.trim(); });
+      ISSUES.forEach(it => {
+        const on = $('.seg[data-i="' + it.id + '"] button[aria-pressed=true]', wrap);
+        nf[it.id] = on ? on.dataset.v : '';
+      });
+      nf.memo = $('#eMemo', wrap).value.trim();
+      nf.noRecord = $('#eNoRec', wrap).checked ? 'Y' : '';
+    } else if (t === 'observation'){
+      nf.kind = $('#eKind', wrap).value;
+      nf.text = $('#eText', wrap).value.trim();
+    } else {
+      const on = $('#eDegree button[aria-pressed=true]', wrap);
+      nf.degree = on ? on.dataset.v : f.degree;
+      nf.note = $('#eNote', wrap).value.trim();
+      if (!nf.show) return alert('프로그램을 고르거나 직접 입력해 주세요.');
+    }
+
+    rec0.fields = nf;
+    rec0.status = 'pending';      // 같은 기록ID 로 다시 올라가 시트의 그 줄을 덮어쓴다
+    rec0.error  = '';
+    await put(rec0);
+    wrap.remove();
+    refreshBox();
+    toast('수정했습니다. 다시 업로드합니다', 2600);
+    if (navigator.onLine && S.endpoint) setTimeout(syncAll, 400);
+  };
 }
 
 /* CSV 내보내기 — 서버가 안 될 때의 최후 수단 */
