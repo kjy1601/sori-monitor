@@ -1,7 +1,7 @@
 /* 2026 소리축제 모니터링 — 오프라인 캐시
    앱 껍데기만 캐시한다. 기록과 녹음은 IndexedDB에 있으므로 여기서 다루지 않는다. */
 
-const CACHE = 'sori-monitor-v3';   // 올릴 때마다 숫자를 올려야 폰에 새 파일이 내려간다
+const CACHE = 'sori-monitor-v4';   // 올릴 때마다 숫자를 올려야 폰에 새 파일이 내려간다
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
